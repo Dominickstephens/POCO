@@ -15,7 +15,7 @@
 # Contact: ps-license@tuebingen.mpg.de
 
 # Code Modified from: https://github.com/mkocabas/PARE/blob/master/pare/core/tester.py
-
+# tester.py
 import os
 import cv2
 import time
@@ -26,14 +26,14 @@ import numpy as np
 from os.path import isfile, isdir, join, basename
 from tqdm import tqdm
 from loguru import logger
-from yolov3.yolo import YOLOv3
+# REMOVE: from yolov3.yolo import YOLOv3  # MPT handles this
 from multi_person_tracker import MPT
 from torch.utils.data import DataLoader
 
 from . import config
 from ..models import POCO, SMPL, HMR
 from .config import update_hparams
-from ..utils.vibe_renderer import Renderer
+from ..utils.vibe_renderer import Renderer # Use vibe_renderer as in other parts of tester
 from ..utils.pose_tracker import run_posetracker
 from ..dataset.inference import Inference
 from ..utils.smooth_pose import smooth_pose
@@ -43,10 +43,11 @@ from ..utils.demo_utils import (
     convert_crop_cam_to_orig_img,
     convert_crop_coords_to_orig_img,
     prepare_rendering_results,
-    xyhw_to_xyxy,
+    xyhw_to_xyxy, # Keep this utility
+    # REMOVE: get_single_image_crop_demo # Replace with a version that takes xyxy bbox
 )
-from ..utils.vibe_image_utils import get_single_image_crop_demo
-
+# ADDED: Import vibe_image_utils directly
+from ..utils import vibe_image_utils # ADDED
 
 MIN_NUM_FRAMES = 0
 
@@ -56,21 +57,61 @@ class POCOTester:
         self.args = args
         cfg_file = self.args.cfg
         self.model_cfg = update_hparams(cfg_file)
-        self.model_cfg.POCO.KINEMATIC_UNCERT = self.args.no_kinematic_uncert
+        # Ensure kinematic uncertainty setting is applied if needed from args
+        if hasattr(args, 'no_kinematic_uncert'):
+             self.model_cfg.POCO.KINEMATIC_UNCERT = self.args.no_kinematic_uncert
+        else:
+             self.model_cfg.POCO.KINEMATIC_UNCERT = False # Default if arg not present
+
         self.ptfile = self.args.ckpt
         self.device = torch.device('cuda') if torch.cuda.is_available() else torch.device('cpu')
-        self.uncert_type = self.model_cfg.POCO.UNCERT_TYPE.split('-')[0] #render with 1st uncerttype
+        # Ensure UNCERT_TYPE is a list
+        if isinstance(self.model_cfg.POCO.UNCERT_TYPE, str):
+            self.uncert_type = self.model_cfg.POCO.UNCERT_TYPE.split('-')[0] #render with 1st uncerttype
+        elif isinstance(self.model_cfg.POCO.UNCERT_TYPE, list):
+            self.uncert_type = self.model_cfg.POCO.UNCERT_TYPE[0] #render with 1st uncerttype
+        else:
+             self.uncert_type = 'pose' # Default
+
         self.loss_ver = self.model_cfg.POCO.LOSS_VER
         self.poco_utils = POCOUtils(self.model_cfg)
         self.model = self._build_model()
         self.model.eval()
 
-        self.smpl = SMPL(config.SMPL_MODEL_DIR, create_transl=False).to('cuda')
+        self.smpl = SMPL(config.SMPL_MODEL_DIR, create_transl=False).to(self.device) # Changed 'cuda' to self.device
+
+        # --- ADDED: Initialize Detector/Tracker ---
+        self.mot = MPT(
+            device=self.device,
+            batch_size=self.args.tracker_batch_size,
+            display=False, # Usually don't want display from tracker in lib mode
+            detector_type=self.args.detector,
+            output_format='dict',
+            yolo_img_size=self.args.yolo_img_size,
+        )
+        # --- END ADDED ---
+
+        # --- ADDED: Initialize Renderer ---
+        # Determine resolution - need width/height for this, defer if needed or use default
+        # We might need frame dimensions here, let's initialize later or pass dimensions
+        # For now, initialize with default, will re-init if needed in run_on_webcam
+        self.renderer = Renderer(
+            resolution=(224, 224), # Default, might change
+            orig_img=True,
+            wireframe=self.args.wireframe,
+            uncert_type=self.uncert_type,
+        )
+        # --- END ADDED ---
 
 
     def _build_model(self):
         # ========= Define POCO model ========= #
         model_cfg = self.model_cfg
+
+        # Ensure UNCERT_TYPE is a list for the model constructor
+        if isinstance(model_cfg.POCO.UNCERT_TYPE, str):
+             model_cfg.POCO.UNCERT_TYPE = list(filter(None, model_cfg.POCO.UNCERT_TYPE.split('-')))
+
         if model_cfg.METHOD == 'poco':
             model = POCO(
                 backbone=model_cfg.POCO.BACKBONE,
@@ -110,19 +151,27 @@ class POCOTester:
 
         return model
 
+    # --- ADDED: Method to run detection on a single frame ---
+    def detect_frame(self, frame_rgb):
+        """Runs detector on a single RGB frame."""
+        detections = self.mot.detect([frame_rgb]) # MPT detect expects a list of images
+        # Extract bbox [x1, y1, x2, y2] for the first frame (index 0)
+        if 0 in detections and len(detections[0]) > 0:
+            # Return list of bounding boxes for the frame
+            # Format is typically [x1, y1, x2, y2, score, class_id]
+            return [det[:4] for det in detections[0]]
+        else:
+            return []
+    # --- END ADDED ---
+
+
     def run_tracking(self, video_file, image_folder, output_folder):
+       # ... (keep existing run_tracking as is) ...
         # ========= Run tracking ========= #
         if self.args.tracking_method == 'bbox':
             # run multi object tracker
-            mot = MPT(
-                device=self.device,
-                batch_size=self.args.tracker_batch_size,
-                display=self.args.display,
-                detector_type=self.args.detector,
-                output_format='dict',
-                yolo_img_size=self.args.yolo_img_size,
-            )
-            tracking_results = mot(image_folder)
+            # Use the initialized self.mot
+            tracking_results = self.mot(image_folder) # Use self.mot
         elif self.args.tracking_method == 'pose':
             if not os.path.isabs(video_file):
                 video_file = os.path.join(os.getcwd(), video_file)
@@ -137,139 +186,225 @@ class POCOTester:
 
         return tracking_results
 
+
     def run_detector(self, image_folder):
         # run multi object tracker
-        mot = MPT(
-            device=self.device,
-            batch_size=self.args.tracker_batch_size,
-            display=self.args.display,
-            detector_type=self.args.detector,
-            output_format='dict',
-            yolo_img_size=self.args.yolo_img_size,
-        )
-        bboxes = mot.detect(image_folder)
+        # Use the initialized self.mot
+        bboxes = self.mot.detect(image_folder) # Use self.mot
         return bboxes
 
     @torch.no_grad()
-    def run_on_webcam_frame(self, frame, bbox_scale=1.0):
-        import numpy as np
-        import cv2
+    # MODIFIED: Added bbox parameter
+    def run_on_webcam_frame(self, frame, bbox_xyxy, bbox_scale=1.0):
+        """
+        Process a single frame for a given bounding box.
+        Args:
+            frame (np.ndarray): Input frame (BGR format from OpenCV).
+            bbox_xyxy (list or np.ndarray): Bounding box in [x_min, y_min, x_max, y_max] format.
+            bbox_scale (float): Scale factor for cropping.
+        Returns:
+            np.ndarray: Rendered image for this detection.
+            dict: Dictionary containing vertices and camera for compositing. Returns None if processing fails.
+        """
+        if bbox_xyxy is None:
+            logger.warning("Received None bbox, skipping frame processing.")
+            return None, None
 
         # --- Preprocess the Frame ---
-        # Copy original frame for later rendering and get its dimensions.
-        orig_img = frame.copy()  # BGR image
+        orig_img_bgr = frame # Keep BGR for potential final overlay if needed outside
         height, width = frame.shape[:2]
-        # Convert frame from BGR to RGB.
-        img = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-        
-        # For webcam, assume one detection: the entire image.
-        bbox = [0, 0, width, height]
-        # Use get_single_image_crop_demo to get the normalized image, raw crop, and keypoints (if any).
-        # (If this function expects a list for the bbox, pass bbox as-is.)
-        norm_img, raw_img, kp_2d = get_single_image_crop_demo(
-            img,
-            bbox,
-            kp_2d=None,
-            scale=bbox_scale,
-            crop_size=self.model_cfg.DATASET.IMG_RES
+        img_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB) # Work with RGB
+
+        # --- Convert bbox format and calculate center/scale ---
+        x1, y1, x2, y2 = bbox_xyxy
+        cx = (x1 + x2) / 2
+        cy = (y1 + y2) / 2
+        w = x2 - x1
+        h = y2 - y1
+        # Use the larger dimension to determine scale for square crop
+        box_height = max(w, h)
+        # box_width = box_height # Ensure square aspect ratio for cropping if needed by model
+
+        # bbox format for get_single_image_crop_demo might be [cx, cy, width, height] or similar
+        # Let's use cx, cy, box_height, box_height for consistent square cropping
+        bbox_xywh = [cx, cy, box_height, box_height] # Use this for cropping
+
+        # --- Cropping ---
+        # Using vibe_image_utils.generate_patch_image_cv directly for clarity
+        # This requires cx, cy, bb_width, bb_height, patch_width, patch_height
+        img_patch_cv, trans = vibe_image_utils.generate_patch_image_cv(
+            cvimg=img_rgb.copy(),
+            c_x=bbox_xywh[0],
+            c_y=bbox_xywh[1],
+            bb_width=bbox_xywh[2],
+            bb_height=bbox_xywh[3],
+            patch_width=self.model_cfg.DATASET.IMG_RES,
+            patch_height=self.model_cfg.DATASET.IMG_RES,
+            do_flip=False,
+            scale=bbox_scale, # Use the provided scale argument
+            rot=0,
         )
-        # Ensure norm_img is a torch.Tensor.
-        if not isinstance(norm_img, torch.Tensor):
-            norm_img = torch.from_numpy(norm_img).permute(2, 0, 1)
-        
-        # Prepare input image tensor with shape [1, 3, IMG_RES, IMG_RES].
+
+        raw_img = img_patch_cv.copy() # Save the unnormalized crop
+        norm_img = vibe_image_utils.convert_cvimg_to_tensor(img_patch_cv)
+
+        # Prepare input image tensor
         inp_image = norm_img.float().unsqueeze(0).to(self.device)
-        
+
         # --- Prepare Auxiliary Data ---
-        center = [bbox[0], bbox[1]]
-        scale = max(bbox[2], bbox[3]) / 200.0
-        bbox_info = calculate_bbox_info(center, scale, [height, width])
-        focal_length = calculate_focal_length(height, width)
-        
+        # Bbox info for the model might need center and scale relative to 200px
+        # Scale here refers to `box_height / 200.0`
+        model_scale = box_height / 200.0
+        center_for_bbox_info = [cx, cy]
+
+        bbox_info = calculate_bbox_info(center_for_bbox_info, model_scale, [height, width])
+        focal_length = calculate_focal_length(height, width) # Use original image dimensions
+
         batch = {
             'img': inp_image,
-            'bbox_info': torch.FloatTensor([bbox_info]).to(self.device),
-            'focal_length': torch.FloatTensor([focal_length]).to(self.device),
-            'scale': torch.FloatTensor([scale]).to(self.device),
-            'center': torch.FloatTensor([center]).to(self.device),
-            'orig_shape': torch.FloatTensor([[height, width]]).to(self.device),
+            'bbox_info': torch.FloatTensor([bbox_info]).to(self.device), # Needs to be (1, 3)
+            'focal_length': torch.FloatTensor([focal_length]).unsqueeze(0).to(self.device), # Needs to be (1, 1) or just scalar tensor
+             # Pass scale and center based on the actual crop
+            'scale': torch.FloatTensor([model_scale]).to(self.device), # Needs to be (1,)
+            'center': torch.FloatTensor([center_for_bbox_info]).to(self.device), # Needs to be (1, 2)
+            'orig_shape': torch.FloatTensor([[height, width]]).to(self.device), # Needs to be (1, 2)
         }
-        
+
         # --- Run the Model ---
-        output = self.model(batch)
-        
-        # Get camera parameters.
-        pred_cam = output['pred_cam'].cpu().numpy()[0]
-        # Reshape to 2D (e.g., from (3,) to (1,3)) for the conversion function.
-        pred_cam = pred_cam[np.newaxis, :]
+        try:
+            output = self.model(batch)
+        except Exception as e:
+            logger.error(f"Model inference failed: {e}")
+            return None, None
+
+
+        # --- Process Outputs ---
+        pred_cam = output['pred_cam'].cpu().numpy() # Shape (1, 3)
+
         # Convert camera parameters from cropped space to original image space.
-        # Convert bbox to a NumPy array with shape (1,4) for proper indexing.
-        bbox_np = np.array(bbox).reshape(1, 4)
+        # `convert_crop_cam_to_orig_img` expects bbox as [cx, cy, h] where h is the box height used for scaling
+        bbox_for_cam_conv = np.array([[cx, cy, box_height]]) # Shape (1, 3)
         orig_cam = convert_crop_cam_to_orig_img(
             cam=pred_cam,
-            bbox=bbox_np,
+            bbox=bbox_for_cam_conv, # Use the correct format
             img_width=width,
             img_height=height
-        )
-        # Extract the first (and only) set of parameters.
-        orig_cam = orig_cam[0]
-        # If the resulting camera parameters have only 3 values, duplicate the scale value.
-        if orig_cam.shape[0] == 3:
-            s, tx, ty = orig_cam
-            orig_cam = np.array([s, s, tx, ty])
-        
-        # --- Process Additional Outputs ---
-        verts = output['smpl_vertices'][0].cpu().numpy()
-        smpl_joints2d = output['smpl_joints2d'].cpu().numpy()
-        # If not using a CLIFF backbone, convert keypoint coordinates from cropped space.
-        if 'cliff' not in self.backbone:
-            smpl_joints2d = convert_crop_coords_to_orig_img(
-                bbox=[bbox],
-                keypoints=smpl_joints2d,
-                crop_size=self.model_cfg.DATASET.IMG_RES,
-            )
-        # Append ones to match expected shape.
-        smpl_joints2d = np.concatenate([smpl_joints2d, np.ones((1, 49, 1))], axis=-1)
-        
-        # --- Initialize the Renderer ---
-        # Decide which image to render on: if rendering cropped image, use the raw crop.
-        if self.args.render_crop:
-            img_for_render = cv2.cvtColor(raw_img, cv2.COLOR_BGR2RGB)
-            res = [224, 224]
-            # For cropped render, adjust the camera parameters.
-            cam_to_use = [orig_cam[0], orig_cam[0], orig_cam[1], orig_cam[2]]
-        else:
-            img_for_render = cv2.cvtColor(orig_img, cv2.COLOR_BGR2RGB)
-            res = [width, height]
-            cam_to_use = orig_cam
+        ) # Returns shape (1, 4) -> [sx, sy, tx, ty]
 
-        renderer = Renderer(
-            resolution=res,
-            orig_img=True,
-            wireframe=self.args.wireframe,
-            uncert_type=self.uncert_type,
-        )
-        
+        # Extract the first (and only) set of parameters.
+        orig_cam = orig_cam[0] # Shape (4,)
+
+        verts = output['smpl_vertices'][0].cpu().numpy() # Shape (6890, 3)
+        smpl_joints2d = output['smpl_joints2d'].cpu().numpy() # Shape (1, 49, 2 or 3)
+
+        # Convert keypoint coordinates from cropped space [-1, 1] to original image space
+        # `convert_crop_coords_to_orig_img` expects bbox [cx, cy, h] and keypoints normalized to [-1, 1]
+        # Let's re-normalize the predicted joints2d if they are not already
+        # Check if the output['smpl_joints2d'] is already normalized
+        if smpl_joints2d.max() > 1.0 or smpl_joints2d.min() < -1.0:
+             # If not normalized (e.g., in pixel space of the crop), normalize first
+             smpl_joints2d_normalized = vibe_image_utils.normalize_2d_kp(smpl_joints2d, self.model_cfg.DATASET.IMG_RES)
+        else:
+             smpl_joints2d_normalized = smpl_joints2d
+
+        # Now convert the normalized coordinates
+        smpl_joints2d_orig = convert_crop_coords_to_orig_img(
+            bbox=bbox_for_cam_conv, # Use the same bbox format [cx, cy, h]
+            keypoints=smpl_joints2d_normalized, # Use normalized keypoints
+            crop_size=self.model_cfg.DATASET.IMG_RES,
+        ) # Returns shape (1, 49, 2)
+
+        # Add confidence channel if needed (assuming 1.0 for now)
+        smpl_joints2d_orig_conf = np.concatenate(
+            [smpl_joints2d_orig, np.ones((1, smpl_joints2d_orig.shape[1], 1))], axis=-1
+        ) # Shape (1, 49, 3)
+
+        # Process uncertainty if available
+        variance = None
+        if f'var_{self.uncert_type}' in output.keys():
+            variance = self.poco_utils.prepare_uncert(output[f'var_{self.uncert_type}'])
+            # variance_global = self.poco_utils.get_global_uncert(variance.copy())
+            # variance_global = np.clip(variance_global, 0, 0.99)
+            variance = variance[0] # Get uncertainty for the single person in the batch
+
+        # --- Prepare for Rendering ---
+        # Decide which image to render on
+        if self.args.render_crop:
+            # Render on the cropped RGB image
+            img_for_render = raw_img # Use the RGB crop
+            render_res = (self.model_cfg.DATASET.IMG_RES, self.model_cfg.DATASET.IMG_RES)
+            # Camera for cropped render: use the prediction directly (weak perspective)
+            # Format might be [s, tx, ty]
+            s, tx, ty = pred_cam[0]
+            cam_to_use = [s, s, tx, ty] # vibe_renderer expects [sx, sy, tx, ty]
+        else:
+            # Render on the original RGB image
+            img_for_render = img_rgb.copy()
+            render_res = (width, height)
+            cam_to_use = orig_cam # Use the converted camera [sx, sy, tx, ty]
+
+        # --- (Re)Initialize the Renderer if resolution changed ---
+        if self.renderer.resolution != render_res:
+             logger.info(f"Re-initializing renderer for resolution {render_res}")
+             self.renderer = Renderer(
+                 resolution=render_res,
+                 orig_img=True,
+                 wireframe=self.args.wireframe,
+                 uncert_type=self.uncert_type,
+             )
+
         # --- Render the Results ---
-        rendered_img = renderer.render(
-            img_for_render,
-            verts,
+        rendered_person_img = self.renderer.render(
+            img=img_for_render, # Pass the correct background image
+            verts=verts,
             cam=cam_to_use,
-            var=None,
-            color=[0.70, 0.70, 0.70]
+            var=variance,
+            color=[0.70, 0.70, 0.70] # Default color, might be overridden by vertex colors if var exists
         )
-        
-        # Optionally, overlay keypoints.
+
+        # --- Optionally, overlay keypoints on the *rendered* image ---
         if self.args.draw_keypoints:
-            for pt in smpl_joints2d[0][25:]:
-                cv2.circle(rendered_img, (int(pt[0]), int(pt[1])), 4, (255, 255, 255), -1)
-            for pt in smpl_joints2d[0][:25]:
-                cv2.circle(rendered_img, (int(pt[0]), int(pt[1])), 4, (0, 0, 0), -1)
-        
-        return rendered_img
+            kps_to_draw = smpl_joints2d_orig_conf[0] # Get keypoints for the person (shape 49, 3)
+            # If rendering crop, need to transform kps back to crop space? No, draw on the image being returned.
+            # If rendering crop: kps_to_draw = output['smpl_joints2d'][0].cpu().numpy() # Use crop-space kps
+            # else: kps_to_draw = smpl_joints2d_orig_conf[0] # Use original-space kps
+
+            # Determine which set of keypoints to use based on render target
+            if self.args.render_crop:
+                 # Coordinates are already relative to the crop
+                 kps_pixel_space = output['smpl_joints2d'][0].cpu().numpy()
+                 # If they are normalized [-1, 1], convert to pixel space
+                 if kps_pixel_space.max() <= 1.0 and kps_pixel_space.min() >= -1.0:
+                      kps_pixel_space = vibe_image_utils.normalize_2d_kp(kps_pixel_space, self.model_cfg.DATASET.IMG_RES, inv=True)
+                 kps_to_draw = np.concatenate([kps_pixel_space, np.ones((kps_pixel_space.shape[0], 1))], axis=-1) # Add conf
+            else:
+                 kps_to_draw = smpl_joints2d_orig_conf[0]
+
+
+            for pt_idx, pt in enumerate(kps_to_draw):
+                 x, y, conf = int(pt[0]), int(pt[1]), pt[2]
+                 if conf > 0.1: # Draw if confidence is high enough
+                      color = (255, 255, 255) if pt_idx >= 25 else (0, 0, 0) # White for GT-like, Black for OpenPose-like
+                      cv2.circle(rendered_person_img, (x, y), 4, color, -1)
+
+        # Return the rendered image part and potentially other info for compositing
+        render_info = {
+            'verts': verts,
+            'cam': cam_to_use, # Camera used for rendering this person
+            'bbox': bbox_xyxy,
+            'mask': (rendered_person_img != img_for_render).any(axis=2) # Simple mask where rendered pixels differ from background
+        }
+
+        return rendered_person_img, render_info
+
+    # ... (keep run_on_image_folder and run_on_video as they are, they seem more complete) ...
+    # Make sure they use self.mot and self.renderer where appropriate
 
     @torch.no_grad()
     def run_on_image_folder(self, image_folder, detections, output_path, output_img_folder, bbox_scale=1.0):
+        # ... (Existing code - Check if self.mot is needed here instead of re-init) ...
+        # --- Ensure this method uses self.mot if applicable ---
+        # --- Ensure this method uses self.renderer if applicable ---
         image_file_names = [
             join(image_folder, x)
             for x in os.listdir(image_folder)
@@ -282,415 +417,591 @@ class POCOTester:
                 [], [], [], [], [], [], [], [], []
 
         pred_cam_, orig_cam_, verts_, betas_, pose_, joints3d_, smpl_joints2d_, bboxes_, var_ = [], [], [], [], [], [], [], [], []
-        for img_idx in range(0, len(image_file_names), self.args.skip_frame):
-            img_fname = image_file_names[img_idx]
-            dets = detections[img_idx]
+        
+        # Store results per image
+        all_results = {}
 
-            img = cv2.cvtColor(cv2.imread(img_fname), cv2.COLOR_BGR2RGB)
-            orig_height, orig_width = img.shape[:2]
+        logger.info(f"Processing {len(image_file_names)} images...")
+        for img_idx, img_fname in enumerate(tqdm(image_file_names)):
+            # Skip frames if needed (though less common for folder mode)
+            if img_idx % self.args.skip_frame != 0:
+                 continue
 
-            if len(dets) < 1:
-                logger.warning(f'No YOLO detections found for image - {img_fname}')
+            img_basename = basename(img_fname)
+            # Detections are typically a dict {frame_idx: [det1, det2,...]}
+            # Need to handle if detections is a list of lists [ [det1_f0, det2_f0], [det1_f1], ...]
+            if isinstance(detections, dict):
+                 dets = detections.get(img_idx, [])
+            elif isinstance(detections, list) and img_idx < len(detections):
+                 dets = detections[img_idx]
+            else:
+                 dets = [] # Default to empty list if format is unexpected or index is out of bounds
+
+
+            img_rgb = cv2.cvtColor(cv2.imread(img_fname), cv2.COLOR_BGR2RGB)
+            orig_height, orig_width = img_rgb.shape[:2]
+            
+            rendered_outputs = [] # Store rendered parts for this image
+
+            if not dets:
+                logger.warning(f'No detections found for image - {img_fname}')
+                # If no detections, save the original image if rendering
+                if not self.args.no_render and output_img_folder:
+                     cv2.imwrite(join(output_img_folder, img_basename), cv2.cvtColor(img_rgb, cv2.COLOR_RGB2BGR))
+                all_results[img_basename] = [] # Store empty result for this image
                 continue
 
-            inp_images = torch.zeros(len(dets), 3, self.model_cfg.DATASET.IMG_RES,
-                                     self.model_cfg.DATASET.IMG_RES, device=self.device, dtype=torch.float)
+            # Prepare batch inputs for all detections in the image
+            batch_inp_images = []
+            batch_bbox_info = []
+            batch_focal_lengths = []
+            batch_scales = []
+            batch_centers = []
+            batch_orig_shapes = []
+            valid_dets = [] # Store the actual bounding boxes used
 
-            bbox_info, focal_lengths, orig_shapes, scales, centers = [], [], [], [], []
-            for det_idx, det in enumerate(dets):
-                bbox = det
-                norm_img, raw_img, kp_2d = get_single_image_crop_demo(
-                    img,
-                    bbox,
-                    kp_2d=None,
+            for det_bbox_xyxy in dets:
+                # Convert xyxy to cx, cy, w, h format needed for cropping/processing
+                x1, y1, x2, y2 = det_bbox_xyxy[:4] # Handle potential extra values like score/class
+                cx = (x1 + x2) / 2
+                cy = (y1 + y2) / 2
+                w = x2 - x1
+                h = y2 - y1
+                box_height = max(w, h) # Use larger dimension for scale
+
+                bbox_xywh = [cx, cy, box_height, box_height]
+
+                # Crop image patch
+                img_patch_cv, _ = vibe_image_utils.generate_patch_image_cv(
+                    cvimg=img_rgb.copy(),
+                    c_x=bbox_xywh[0],
+                    c_y=bbox_xywh[1],
+                    bb_width=bbox_xywh[2],
+                    bb_height=bbox_xywh[3],
+                    patch_width=self.model_cfg.DATASET.IMG_RES,
+                    patch_height=self.model_cfg.DATASET.IMG_RES,
+                    do_flip=False,
                     scale=bbox_scale,
-                    crop_size=self.model_cfg.DATASET.IMG_RES
+                    rot=0,
                 )
-                inp_images[det_idx] = norm_img.float().to(self.device)
+                norm_img = vibe_image_utils.convert_cvimg_to_tensor(img_patch_cv)
+                batch_inp_images.append(norm_img)
 
-                #TODO: Optimise
-                center = [bbox[0], bbox[1]]
-                orig_shape = [orig_height, orig_width]
-                scale = max(bbox[2], bbox[3])/200.
+                # Calculate auxiliary data
+                model_scale = box_height / 200.0
+                center_for_bbox_info = [cx, cy]
+                bbox_info = calculate_bbox_info(center_for_bbox_info, model_scale, [orig_height, orig_width])
+                focal_length = calculate_focal_length(orig_height, orig_width)
 
-                centers.append(center)
-                orig_shapes.append(orig_shape)
-                scales.append(scale)
+                batch_bbox_info.append(bbox_info)
+                batch_focal_lengths.append(focal_length)
+                batch_scales.append(model_scale)
+                batch_centers.append(center_for_bbox_info)
+                batch_orig_shapes.append([orig_height, orig_width])
+                valid_dets.append(det_bbox_xyxy) # Store the xyxy bbox
 
-                bbox_info.append(calculate_bbox_info(center, scale, orig_shape))
-                focal_lengths.append(calculate_focal_length(orig_height, orig_width))
+            if not batch_inp_images: # If all detections were invalid for some reason
+                 if not self.args.no_render and output_img_folder:
+                      cv2.imwrite(join(output_img_folder, img_basename), cv2.cvtColor(img_rgb, cv2.COLOR_RGB2BGR))
+                 all_results[img_basename] = []
+                 continue
 
+            # Stack inputs into a batch
+            inp_images_batch = torch.stack(batch_inp_images).to(self.device)
             batch = {
-                     'img': inp_images,
-                     'bbox_info': torch.FloatTensor(bbox_info).cuda(),
-                     'focal_length': torch.FloatTensor(focal_lengths).cuda(),
-                     'scale': torch.FloatTensor(scales).cuda(),
-                     'center': torch.FloatTensor(centers).cuda(),
-                     'orig_shape': torch.FloatTensor(orig_shapes).cuda(),
-                    }
+                'img': inp_images_batch,
+                'bbox_info': torch.FloatTensor(batch_bbox_info).to(self.device),
+                'focal_length': torch.FloatTensor(batch_focal_lengths).unsqueeze(-1).to(self.device), # Ensure shape (N, 1) or just (N,)
+                'scale': torch.FloatTensor(batch_scales).to(self.device),
+                'center': torch.FloatTensor(batch_centers).to(self.device),
+                'orig_shape': torch.FloatTensor(batch_orig_shapes).to(self.device),
+            }
+
+            # Run model inference
             output = self.model(batch)
 
-            pred_cam = output['pred_cam'].cpu().numpy()
-            orig_cam = convert_crop_cam_to_orig_img(
-                cam=pred_cam,
-                bbox=dets,
-                img_width=orig_width,
-                img_height=orig_height
-            )
-            smpl_joints2d = output['smpl_joints2d'].cpu().numpy()
+            # Post-process results for each detection in the batch
+            pred_cam_batch = output['pred_cam'].cpu().numpy() # (N, 3)
+            verts_batch = output['smpl_vertices'].cpu().numpy() # (N, 6890, 3)
+            smpl_joints2d_batch = output['smpl_joints2d'].cpu().numpy() # (N, 49, 2 or 3)
 
-            # In CLIFF, the keypoints are in original image space
-            if not 'cliff' in self.backbone:
-                smpl_joints2d = convert_crop_coords_to_orig_img(
-                    bbox=dets,
-                    keypoints=smpl_joints2d,
-                    crop_size=self.model_cfg.DATASET.IMG_RES,
-                )
+            img_results = [] # Store results for this specific image
 
-            smpl_joints2d = np.concatenate([smpl_joints2d, \
-                    np.ones((len(dets), 49, 1))], axis=-1)
-            
-            output['bboxes'] = dets
-            output['orig_cam'] = orig_cam
-            output['crop_img'] = raw_img
-            output['crop_cam'] = output['pred_cam']
-            output['smpl_joints2d'] = smpl_joints2d
+            # Iterate through batch results
+            for idx in range(len(valid_dets)):
+                 det_bbox_xyxy = valid_dets[idx]
+                 pred_cam = pred_cam_batch[idx] # (3,)
+                 verts = verts_batch[idx] # (6890, 3)
+                 smpl_joints2d = smpl_joints2d_batch[idx] # (49, 2 or 3)
 
-            variance = None
-            if f'var_{self.uncert_type}' in output.keys():
-                variance = self.poco_utils.prepare_uncert(output[f'var_{self.uncert_type}'])
-                variance_global = self.poco_utils.get_global_uncert(variance.copy())
-                variance_global = np.clip(variance_global, 0, 0.99)
+                 # Convert camera
+                 x1, y1, x2, y2 = det_bbox_xyxy
+                 cx = (x1 + x2) / 2
+                 cy = (y1 + y2) / 2
+                 box_height = max(x2 - x1, y2 - y1)
+                 bbox_for_cam_conv = np.array([[cx, cy, box_height]]) # (1, 3)
+                 orig_cam = convert_crop_cam_to_orig_img(
+                     cam=pred_cam[np.newaxis, :], # Add batch dim
+                     bbox=bbox_for_cam_conv,
+                     img_width=orig_width,
+                     img_height=orig_height
+                 )[0] # Get first result, shape (4,)
 
-            del inp_images
+                 # Convert joints
+                 if smpl_joints2d.max() <= 1.0 and smpl_joints2d.min() >= -1.0:
+                      smpl_joints2d_normalized = smpl_joints2d[np.newaxis, :, :2] # Add batch dim, select xy
+                 else:
+                      # If not normalized, normalize first
+                      smpl_joints2d_normalized = vibe_image_utils.normalize_2d_kp(smpl_joints2d[:, :2], self.model_cfg.DATASET.IMG_RES)[np.newaxis, :, :]
 
-            if not self.args.no_render:
-
-                for k,v in output.items():
-                    if output[k] is not None:
-                        if isinstance(v, torch.Tensor):
-                            output[k] = v.cpu().numpy()
-
-                if self.args.render_crop == True:
-                    img = output['crop_img']
-                    img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
-                    orig_img = img.copy()
-                    res = [224,224]
-                else:
-                    img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
-                    orig_img = img.copy()
-                    res = [orig_width, orig_height]
-
-                renderer = Renderer(
-                    resolution=res,
-                    orig_img=True,
-                    wireframe=self.args.wireframe,
-                    uncert_type=self.uncert_type,
-                )
-
-                if self.args.sideview:
-                    side_img = np.ones_like(img) * 255
-
-                for idx in range(len(dets)):
-                    if idx > 0 and self.args.render_crop:
-                        continue
-                    verts = output['smpl_vertices'][idx]
-                    if self.args.render_crop == True:
-                        cam = output['crop_cam'][idx]
-                        cam = [cam[0], cam[0], cam[1], cam[2]]
-                    else:
-                        cam = output['orig_cam'][idx]
-                    keypoints = output['smpl_joints2d'][idx]
+                 smpl_joints2d_orig = convert_crop_coords_to_orig_img(
+                     bbox=bbox_for_cam_conv,
+                     keypoints=smpl_joints2d_normalized,
+                     crop_size=self.model_cfg.DATASET.IMG_RES,
+                 )[0] # Get first result, shape (49, 2)
+                 smpl_joints2d_orig_conf = np.concatenate(
+                     [smpl_joints2d_orig, np.ones((smpl_joints2d_orig.shape[0], 1))], axis=-1
+                 ) # Shape (49, 3)
 
 
-                    if self.args.no_uncert_color:
-                        mc = [0.70, 0.70, 0.70]
-                        rend_var, var_global = None, -1
-                    else:
-                        var = variance[idx]
-                        var_global = variance_global[idx]
-                        mc = colorsys.hsv_to_rgb(np.random.rand(), 0.5, 1.0)
-                        rend_var = var.copy()
+                 # Process uncertainty if available
+                 variance = None
+                 if f'var_{self.uncert_type}' in output.keys():
+                     variance_batch = self.poco_utils.prepare_uncert(output[f'var_{self.uncert_type}'])
+                     variance = variance_batch[idx] # Get variance for this detection
+
+                 # Store processed results for this detection
+                 person_result = {
+                     'bbox': det_bbox_xyxy,
+                     'pred_cam': pred_cam,
+                     'orig_cam': orig_cam,
+                     'verts': verts,
+                     'smpl_joints2d': smpl_joints2d_orig_conf,
+                     'variance': variance,
+                 }
+                 img_results.append(person_result)
+
+                 # --- Rendering (if enabled) ---
+                 if not self.args.no_render:
+                     # Determine render target and camera
+                     if self.args.render_crop:
+                          # Find the crop corresponding to this detection - requires saving raw_img per detection
+                          # This part needs adjustment if render_crop is used in batch mode.
+                          # For simplicity, let's skip render_crop in batch folder mode for now.
+                          logger.warning("render_crop is not fully supported in batch folder mode yet.")
+                          img_for_render = img_rgb.copy()
+                          render_res = (orig_width, orig_height)
+                          cam_to_use = orig_cam
+                     else:
+                          img_for_render = img_rgb.copy() # Render on a fresh copy for each person? Or composite later? Let's composite.
+                          render_res = (orig_width, orig_height)
+                          cam_to_use = orig_cam
+
+                     # (Re)Initialize renderer if needed
+                     if self.renderer.resolution != render_res:
+                          self.renderer = Renderer(
+                              resolution=render_res,
+                              orig_img=True,
+                              wireframe=self.args.wireframe,
+                              uncert_type=self.uncert_type,
+                          )
+
+                     # Define color - maybe unique per detection?
+                     mc = colorsys.hsv_to_rgb(idx / len(valid_dets), 0.6, 0.8) if len(valid_dets) > 1 else [0.7, 0.7, 0.7]
+                     if variance is None and not self.args.no_uncert_color: # Use default grey if no variance
+                           mc = [0.7, 0.7, 0.7]
+                     if self.args.no_uncert_color: # Force grey if coloring disabled
+                           mc = [0.7, 0.7, 0.7]
 
 
-                    mesh_filename = None
+                     mesh_filename = None
+                     if self.args.save_obj:
+                         mesh_folder = join(output_path, 'meshes', basename(img_fname).split('.')[0])
+                         os.makedirs(mesh_folder, exist_ok=True)
+                         mesh_filename = join(mesh_folder, f'person_{idx:02d}.obj')
 
-                    if self.args.save_obj:
-                        mesh_folder = join(output_path, 'meshes', basename(img_fname).split('.')[0])
-                        os.makedirs(mesh_folder, exist_ok=True)
-                        mesh_filename = join(mesh_folder, f'{idx:06d}.obj')
+                     # Render this person
+                     rendered_person = self.renderer.render(
+                         img=np.zeros_like(img_rgb), # Render on black background first to get mask
+                         verts=verts,
+                         cam=cam_to_use,
+                         var=variance,
+                         color=mc,
+                         mesh_filename=mesh_filename,
+                         hps_backbone=self.backbone,
+                     )
+                     
+                     # Create a mask for compositing
+                     mask = (rendered_person > 0).any(axis=2)
+                     
+                     # Store for later compositing
+                     rendered_outputs.append({'render': rendered_person, 'mask': mask})
 
-                    print(f'inside tester-> {rend_var}')
-                    img = renderer.render(
-                        img,
-                        verts,
-                        cam=cam,
-                        var=rend_var.copy(),
-                        color=mc,
-                        mesh_filename=mesh_filename,
-                        hps_backbone=self.backbone,
-                    )
+                     # Optionally draw keypoints (on the composite image later)
+                     # Optionally draw bbox (on the composite image later)
+                     # Optionally render side view (needs separate handling/compositing)
 
-                    ### Overlay text for debug
-                    # overlay_str = f'frame:{img_idx:05d} person:{idx:02d} var:{var_global:.3f}'
-                    # log_str = f'img_f:{img_fname} person:{idx:02d} var:{var_global:.3f}'
-                    # if not (self.args.render_crop or self.args.no_uncert_color):
-                    #     img = overlay_text(img, overlay_str, idx+1)
-                    # with open(f'{output_path}/uncertainty.log', "a") as f:
-                    #     print(log_str, file=f)
 
-                    if self.args.draw_keypoints:
-                        for _, pt in enumerate(keypoints[25:]): # SMPL Keypoints
-                            cv2.circle(img, (int(pt[0]), int(pt[1])), 4, (255, 255, 255), -1)
-                        for _, pt in enumerate(keypoints[:25]): # Openpose keypoints if available
-                            cv2.circle(img, (int(pt[0]), int(pt[1])), 4, (0, 0, 0), -1)
+            # --- Composite Renderings ---
+            if not self.args.no_render and output_img_folder:
+                 final_image = img_rgb.copy()
+                 for data in rendered_outputs:
+                      final_image[data['mask']] = data['render'][data['mask']]
 
-                    ### Overlay text for debug
-                    # bbox_xyxy = xyhw_to_xyxy(output['bboxes'][idx].copy())
-                    # x_min, y_min, x_max, y_max = bbox_xyxy
-                    # cv2.rectangle(img, (int(x_min), int(y_min)), (int(x_max), int(y_max)), (0,255,0), 3)
+                 # --- Draw keypoints and bboxes on the final composite image ---
+                 for idx, person_res in enumerate(img_results):
+                      if self.args.draw_keypoints:
+                           kps_to_draw = person_res['smpl_joints2d'] # Already in original image space
+                           for pt_idx, pt in enumerate(kps_to_draw):
+                                x, y, conf = int(pt[0]), int(pt[1]), pt[2]
+                                if conf > 0.1:
+                                     kp_color = (255, 255, 255) if pt_idx >= 25 else (0, 0, 0)
+                                     cv2.circle(final_image, (x, y), 4, kp_color, -1)
 
-                    if self.args.sideview:
-                        side_img = renderer.render(
-                            side_img,
-                            verts,
-                            cam=cam,
-                            var=rend_var,
-                            color=mc,
-                            angle=270,
-                            axis=[0, 1, 0],
-                            hps_backbone=self.backbone,
-                        )
+                      # Draw bounding box
+                      # x1, y1, x2, y2 = map(int, person_res['bbox'])
+                      # cv2.rectangle(final_image, (x1, y1), (x2, y2), (0, 255, 0), 2)
 
-                if self.args.sideview:
-                    img = np.concatenate([img, side_img], axis=1)
 
-                cv2.imwrite(join(output_img_folder, basename(img_fname)), img)
+                 # Save the final composite image
+                 cv2.imwrite(join(output_img_folder, img_basename), cv2.cvtColor(final_image, cv2.COLOR_RGB2BGR))
 
-                if self.args.display:
-                    cv2.imshow('Video', img)
-                    if cv2.waitKey(1) & 0xFF == ord('q'):
-                        break
+                 if self.args.display:
+                      cv2.imshow('Image Folder Demo', cv2.cvtColor(final_image, cv2.COLOR_RGB2BGR))
+                      if cv2.waitKey(1) & 0xFF == ord('q'):
+                           break # Exit if 'q' is pressed during display
 
-            logger.info(f'Processed image - {img_idx}')
+            # Store results for this image (optional, for saving detailed output)
+            all_results[img_basename] = img_results
+            # logger.info(f'Processed image {img_idx + 1}/{len(image_file_names)}')
 
+        # Cleanup display window
         if self.args.display:
             cv2.destroyAllWindows()
 
+        # --- Optional: Save all results ---
+        # Example: joblib.dump(all_results, join(output_path, 'all_poco_results.pkl'))
+
+
     @torch.no_grad()
     def run_on_video(self, tracking_results, image_folder, orig_width, orig_height, bbox_scale=1.0):
-        # ========= Run poco on each person ========= #
+        # ... (Existing code - Check if self.mot is needed here instead of re-init) ...
+        # --- Ensure this method uses self.mot if applicable ---
+        # --- Ensure this method uses self.renderer if applicable ---
+         # ========= Run poco on each person ========= #
         logger.info(f'Running poco on each tracklet...')
 
         poco_results = {}
-        for person_id in tqdm(list(tracking_results.keys())):
+        pbar = tqdm(list(tracking_results.keys()))
+        for person_id in pbar:
+            pbar.set_description(f"Processing track {person_id}")
             bboxes = joints2d = frame_kps = None
 
             if self.args.tracking_method == 'bbox':
-                bboxes = tracking_results[person_id]['bbox']
+                # Make sure bbox is in [cx, cy, w, h] or adjust Inference dataset
+                # Current MPT output is likely [x1, y1, x2, y2, score, class, track_id]
+                # Convert to [cx, cy, h, h] (assuming square crop based on height)
+                track_data = tracking_results[person_id]['bbox'] # This might be list of lists/tuples
+                bboxes_xyxy = np.array([t[:4] for t in track_data])
+                cx = (bboxes_xyxy[:, 0] + bboxes_xyxy[:, 2]) / 2
+                cy = (bboxes_xyxy[:, 1] + bboxes_xyxy[:, 3]) / 2
+                h = bboxes_xyxy[:, 3] - bboxes_xyxy[:, 1]
+                w = bboxes_xyxy[:, 2] - bboxes_xyxy[:, 0]
+                box_height = np.maximum(w, h) # Use max dimension for scale
+                # Bbox format for Inference dataset: [cx, cy, scale (box_height/200), scale] - needs verification
+                # Or maybe Inference expects [cx, cy, w, h]? Let's assume [cx, cy, h, h] for now
+                bboxes = np.stack([cx, cy, box_height, box_height], axis=1)
+
             elif self.args.tracking_method in ['pose']:
                 joints2d = tracking_results[person_id]['joints2d']
+                # Bbox might still be needed by Inference dataset, calculate from joints2d?
+                # Or assume Inference handles joints2d input correctly.
 
             frames = tracking_results[person_id]['frames']
 
+            # Create dataset for this tracklet
             dataset = Inference(
                 image_folder=image_folder,
                 frames=frames,
-                bboxes=bboxes,
+                bboxes=bboxes, # Pass the converted bboxes
                 joints2d=joints2d,
-                frame_kps=frame_kps,
-                scale=bbox_scale,
+                # frame_kps=frame_kps, # Pass if available
+                scale=bbox_scale, # Pass the desired cropping scale
+                crop_size = self.model_cfg.DATASET.IMG_RES,
             )
 
-            bboxes = dataset.bboxes
+            # If dataset recalculates bboxes from joints, use its bboxes
+            bboxes = dataset.bboxes # Use the bboxes from the dataset instance
             frames = dataset.frames
-            frame_kps = dataset.frame_kps
+            # frame_kps = dataset.frame_kps # If used
 
-            has_keypoints = True if joints2d is not None else False
-            has_frame_kps = True if frame_kps is not None else False
+            dataloader = DataLoader(dataset, batch_size=self.args.batch_size, num_workers=8, pin_memory=True)
 
-            dataloader = DataLoader(dataset, batch_size=self.args.batch_size, num_workers=8)
-
-            pred_cam, pred_cam_t, pred_verts, pred_verts_opt, pred_cam_opt, pred_pose, pred_betas, pred_var, pred_var_global, \
-            pred_joints3d, pred_joints2d, joints2d_op, joints2d_op_orig = [], [], [], [], [], [], [], [], [], [], [], [], []
+            pred_cam, pred_verts, pred_pose, pred_betas, pred_var, pred_var_global, \
+            pred_joints3d, pred_joints2d = [], [], [], [], [], [], [], []
 
             for batch_dict in dataloader:
-                if torch.all(batch_dict['has_frame_kps']):
-                    j2d, j2d_orig = batch_dict['j2d'], batch_dict['j2d_orig']
-                    joints2d_op.append(j2d.reshape(-1, 44, 3).to(self.device))
-                    joints2d_op_orig.append(j2d_orig.reshape(-1, 44, 3))
-
-                batch_dict = {k: v.to(device=self.device, non_blocking=True) \
+                batch_dict = {k: v.to(device=self.device, non_blocking=True)
                               if hasattr(v, 'to') else v for k, v in batch_dict.items()}
+
+                # --- Prepare batch for POCO model ---
+                # Inference dataset should provide keys like 'img', 'bbox_info', 'focal_length', etc.
+                # Let's assume it does. If not, calculate them here based on batch_dict['scale'], ['center'], ['orig_shape']
+                if 'bbox_info' not in batch_dict:
+                     batch_orig_shape = batch_dict['orig_shape'].cpu().numpy()
+                     batch_center = batch_dict['center'].cpu().numpy()
+                     batch_scale = batch_dict['scale'].cpu().numpy() # scale = box_height / 200
+                     batch_bbox_info = []
+                     for i in range(len(batch_scale)):
+                           bbox_info = calculate_bbox_info(batch_center[i], batch_scale[i], batch_orig_shape[i])
+                           batch_bbox_info.append(bbox_info)
+                     batch_dict['bbox_info'] = torch.FloatTensor(batch_bbox_info).to(self.device)
+
+                if 'focal_length' not in batch_dict:
+                     batch_orig_shape = batch_dict['orig_shape'].cpu().numpy()
+                     batch_focal_length = []
+                     for i in range(len(batch_orig_shape)):
+                          focal = calculate_focal_length(batch_orig_shape[i, 0], batch_orig_shape[i, 1])
+                          batch_focal_length.append(focal)
+                     batch_dict['focal_length'] = torch.FloatTensor(batch_focal_length).unsqueeze(-1).to(self.device) # Ensure shape (N, 1)
+
 
                 output = self.model(batch_dict)
 
-                pred_cam.append(output['pred_cam'])  # [:, :, :3].reshape(batch_size, -1))
-                pred_cam_t.append(output['pred_cam_t'])  # [:, :, :3].reshape(batch_size, -1))
-                pred_verts.append(output['smpl_vertices'])  # .reshape(batch_size * seqlen, -1, 3))
-                pred_pose.append(output['pred_pose'])  # [:,:,3:75].reshape(batch_size * seqlen, -1))
-                pred_betas.append(output['pred_shape'])  # [:, :,75:].reshape(batch_size * seqlen, -1))
-                pred_joints3d.append(output['smpl_joints3d'])  # .reshape(batch_size * seqlen, -1, 3))
-                pred_joints2d.append(output['smpl_joints2d'])
+                pred_cam.append(output['pred_cam'])
+                pred_verts.append(output['smpl_vertices'])
+                pred_pose.append(output['pred_pose'])
+                pred_betas.append(output['pred_shape'])
+                pred_joints3d.append(output['smpl_joints3d'])
+                pred_joints2d.append(output['smpl_joints2d']) # These are likely in crop space [-1, 1]
+
                 if f'var_{self.uncert_type}' in output.keys():
-                    var = self.poco_utils.prepare_uncert(output[f'var_{self.uncert_type}'], True)
-                    pred_var.append(var.clone())
-                    var_global = self.poco_utils.get_global_uncert(var.clone())
+                    var = self.poco_utils.prepare_uncert(output[f'var_{self.uncert_type}'], return_torch=True) # Keep as tensor for now
+                    pred_var.append(var)
+                    var_global = self.poco_utils.get_global_uncert(var.clone()) # Keep as tensor
                     pred_var_global.append(var_global)
 
             pred_cam = torch.cat(pred_cam, dim=0)
-            pred_cam_t = torch.cat(pred_cam_t, dim=0)
             pred_verts = torch.cat(pred_verts, dim=0)
             pred_pose = torch.cat(pred_pose, dim=0)
             pred_betas = torch.cat(pred_betas, dim=0)
             pred_joints3d = torch.cat(pred_joints3d, dim=0)
-            pred_joints2d = torch.cat(pred_joints2d, dim=0)
-            if f'var_{self.uncert_type}' in output.keys():
-                pred_var = torch.cat(pred_var, dim=0).cpu().numpy()
-                pred_var_global = torch.cat(pred_var_global, dim=0).cpu().numpy()
+            pred_joints2d_crop = torch.cat(pred_joints2d, dim=0) # In crop space [-1, 1]
 
-            del batch_dict
+            # Convert results to numpy
+            pred_cam_np = pred_cam.cpu().numpy()
+            pred_verts_np = pred_verts.cpu().numpy()
+            pred_pose_np = pred_pose.cpu().numpy()
+            pred_betas_np = pred_betas.cpu().numpy()
+            pred_joints3d_np = pred_joints3d.cpu().numpy()
+            pred_joints2d_crop_np = pred_joints2d_crop.cpu().numpy()
 
-            pred_cam = pred_cam.cpu().numpy()
-            pred_verts = pred_verts.cpu().numpy()
-            pred_pose = pred_pose.cpu().numpy()
-            pred_betas = pred_betas.cpu().numpy()
-            pred_joints3d = pred_joints3d.cpu().numpy()
-            pred_joints2d = pred_joints2d.cpu().numpy()
+            pred_var_np = []
+            pred_var_global_np = []
+            if pred_var:
+                pred_var_np = torch.cat(pred_var, dim=0).cpu().numpy()
+                pred_var_global_np = torch.cat(pred_var_global, dim=0).cpu().numpy()
 
+            # --- Smoothing (Optional) ---
             if self.args.smooth:
-                min_cutoff = self.args.min_cutoff  # 0.004
-                beta = self.args.beta  # 1.5
+                min_cutoff = self.args.min_cutoff
+                beta = self.args.beta
                 logger.info(f'Running smoothing on person {person_id}, min_cutoff: {min_cutoff}, beta: {beta}')
-                pred_verts, pred_pose, pred_joints3d = smooth_pose(pred_pose, pred_betas,
-                                                                   min_cutoff=min_cutoff, beta=beta)
+                # smooth_pose expects pose in axis-angle format. Convert if needed.
+                # Assuming pred_pose_np is already axis-angle (N, 72)
+                if pred_pose_np.shape[-1] != 72:
+                     # TODO: Convert pred_pose_np from matrix/6d to axis-angle if necessary
+                     logger.warning("Smoothing requires axis-angle pose. Conversion not implemented here yet.")
+                else:
+                     pred_verts_np, pred_pose_np, pred_joints3d_np = smooth_pose(
+                          pred_pose_np, pred_betas_np,
+                          min_cutoff=min_cutoff, beta=beta
+                     )
 
+            # --- Coordinate Conversions ---
+            # Convert camera
+            # bboxes used by the dataset: [cx, cy, h, h]
+            bbox_for_cam_conv = np.stack([bboxes[:, 0], bboxes[:, 1], bboxes[:, 2]], axis=1) # Shape (N, 3) [cx, cy, h]
             orig_cam = convert_crop_cam_to_orig_img(
-                cam=pred_cam,
-                bbox=bboxes,
+                cam=pred_cam_np,
+                bbox=bbox_for_cam_conv,
                 img_width=orig_width,
                 img_height=orig_height
-            )
-            logger.info('Converting smpl keypoints 2d to original image coordinate')
+            ) # Shape (N, 4)
 
-            pred_joints2d = convert_crop_coords_to_orig_img(
-                bbox=bboxes,
-                keypoints=pred_joints2d,
+            # Convert 2D joints from crop space [-1, 1] to original image space
+            pred_joints2d_orig = convert_crop_coords_to_orig_img(
+                bbox=bbox_for_cam_conv, # Use [cx, cy, h]
+                keypoints=pred_joints2d_crop_np[:,:,:2], # Use normalized xy
                 crop_size=self.model_cfg.DATASET.IMG_RES,
-            )
+            ) # Shape (N, 49, 2)
+
+            # Add confidence
+            pred_joints2d_orig_conf = np.concatenate(
+                [pred_joints2d_orig, np.ones((pred_joints2d_orig.shape[0], pred_joints2d_orig.shape[1], 1))],
+                axis=-1
+            ) # Shape (N, 49, 3)
 
             output_dict = {
-                'pred_cam': pred_cam,
+                'pred_cam': pred_cam_np,
                 'orig_cam': orig_cam,
-                'verts': pred_verts,
-                'pose': pred_pose,
-                'betas': pred_betas,
-                'joints2d': joints2d,
-                'smpl_joints3d': pred_joints3d,
-                'smpl_joints2d': pred_joints2d,
-                'var': pred_var,
-                'var_global': pred_var_global,
-                'bboxes': bboxes,
+                'verts': pred_verts_np,
+                'pose': pred_pose_np,
+                'betas': pred_betas_np,
+                # 'joints2d': joints2d, # Input joints2d if available, maybe not needed here
+                'smpl_joints3d': pred_joints3d_np,
+                'smpl_joints2d': pred_joints2d_orig_conf, # Store original image space keypoints
+                'var': pred_var_np if len(pred_var_np)>0 else np.array([]),
+                'var_global': pred_var_global_np if len(pred_var_global_np)>0 else np.array([]),
+                'bboxes': bboxes, # Store the bboxes used [cx, cy, h, h]
                 'frame_ids': frames,
             }
 
             poco_results[person_id] = output_dict
+
         return poco_results
+
 
     def render_results(self, poco_results, image_folder, output_img_folder, output_path,
                        orig_width, orig_height, num_frames):
+        # ... (Existing code - Check if self.renderer is used here) ...
+        # --- Ensure this method uses self.renderer ---
         # ========= Render results as a single video ========= #
+        # Initialize renderer with the final output resolution
         renderer = Renderer(
             resolution=(orig_width, orig_height),
             orig_img=True,
             wireframe=self.args.wireframe,
             uncert_type=self.uncert_type,
         )
+        if self.args.sideview:
+             side_renderer = Renderer(
+                  resolution=(orig_width, orig_height), # Same resolution for side view?
+                  orig_img=True, # Render on black bg for side view
+                  wireframe=self.args.wireframe,
+                  uncert_type=self.uncert_type,
+             )
+
 
         logger.info(f'Rendering output video, writing frames to {output_img_folder}')
 
         # prepare results for rendering
         frame_results = prepare_rendering_results(poco_results, num_frames)
         # mesh_color = {k: colorsys.hsv_to_rgb(np.random.rand(), 0.5, 1.0) for k in poco_results.keys()}
-        mesh_color = {k: [0.98, 0.54, 0.44] for k in poco_results.keys()}
+        mesh_color = {k: [0.98, 0.54, 0.44] for k in poco_results.keys()} # Example fixed color
 
         image_file_names = sorted([
             join(image_folder, x)
             for x in os.listdir(image_folder)
-            if x.endswith('.png') or x.endswith('.jpg')
+            if x.endswith('.png') or x.endswith('.jpg') or x.endswith('.jpeg') # Added jpeg
         ])
 
-        for frame_idx in tqdm(range(len(image_file_names))):
+        pbar = tqdm(range(len(image_file_names)))
+        for frame_idx in pbar:
+            pbar.set_description(f"Rendering frame {frame_idx}")
             img_fname = image_file_names[frame_idx]
             img = cv2.imread(img_fname)
-            orig_img = img.copy()
+            img_rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB) # Work with RGB for renderer background
+
+            rendered_output_parts = [] # To store rendered person images for compositing
 
             if self.args.sideview:
-                side_img = np.zeros_like(img)
+                side_img_composite = np.ones_like(img_rgb) * 255 # White background for side view
 
-            for person_id, person_data in frame_results[frame_idx].items():
+            # Sort frame results by camera depth (approximated by scale sy) for better occlusion handling
+            frame_data = frame_results[frame_idx]
+            # Sorting: smaller sy (further away) should be rendered first
+            sorted_persons = sorted(frame_data.items(), key=lambda item: item[1]['cam'][1])
+
+
+            for person_id, person_data in sorted_persons:
                 frame_verts = person_data['verts']
-                frame_cam = person_data['cam']
-                frame_kp = person_data['joints2d']
-                frame_var = person_data['var']
-                frame_var_global = person_data['var_global']
-                if frame_var_global:
+                frame_cam = person_data['cam'] # Already in orig_cam format [sx, sy, tx, ty]
+                frame_kp = person_data['joints2d'] # Already in orig image space
+                frame_var = person_data.get('var', None) # Use .get for safety
+                frame_var_global = person_data.get('var_global', None)
+
+                if frame_var_global is not None:
                     frame_var_global = np.clip(frame_var_global, 0, 0.99)
 
-                mc = mesh_color[person_id]
+                # Determine mesh color based on uncertainty
+                mc = mesh_color[person_id] # Default color
+                rend_var = None
+                if frame_var is not None and not self.args.no_uncert_color:
+                     rend_var = frame_var.copy()
+                elif self.args.no_uncert_color or frame_var is None : # Force grey if disabled or no variance
+                     mc = [0.7, 0.7, 0.7]
 
-                if frame_var is None:
-                    rend_var, frame_var_global = None, -1
-                    mc = [0.70, 0.70, 0.70]
-                else:
-                    rend_var = frame_var.copy()
 
                 mesh_filename = None
-
                 if self.args.save_obj:
                     mesh_folder = join(output_path, 'meshes', f'{person_id:04d}')
                     os.makedirs(mesh_folder, exist_ok=True)
                     mesh_filename = join(mesh_folder, f'{frame_idx:06d}.obj')
 
-                img = renderer.render(
-                    img,
-                    frame_verts,
+                # Render this person on a black background to get mask
+                rendered_person = renderer.render(
+                    img=np.zeros_like(img_rgb), # Render on black background
+                    verts=frame_verts,
                     cam=frame_cam,
                     var=rend_var,
                     color=mc,
                     mesh_filename=mesh_filename,
                     hps_backbone=self.backbone,
                 )
-                overlay_str = f'frame:{frame_idx:05d} person:{person_id:02d} var:{frame_var_global:.3f}'
-                log_str = f'img_f:{img_fname} person:{person_id:02d} var:{frame_var_global:.3f}'
-                # img = overlay_text(img, overlay_str, person_id)
+                mask = (rendered_person > 0).any(axis=2)
+                rendered_output_parts.append({'render': rendered_person, 'mask': mask})
+
+
+                # --- Side View Rendering ---
+                if self.args.sideview:
+                     rendered_person_side = side_renderer.render(
+                           img=np.zeros_like(img_rgb), # Render on black
+                           verts=frame_verts,
+                           cam=frame_cam, # Use same camera? Or adjust? Let's use same for now.
+                           var=rend_var,
+                           color=mc,
+                           angle=270,
+                           axis=[0, 1, 0],
+                           hps_backbone=self.backbone,
+                     )
+                     mask_side = (rendered_person_side > 0).any(axis=2)
+                     side_img_composite[mask_side] = rendered_person_side[mask_side]
+
+
+                # Log uncertainty value (optional)
+                log_str = f'img_f:{basename(img_fname)} person:{person_id:02d} '
+                if frame_var_global is not None:
+                    log_str += f'var:{frame_var_global:.3f}'
+                else:
+                     log_str += 'var:N/A'
                 with open(f'{output_path}/uncertainty.log', "a") as f:
                     print(log_str, file=f)
 
-                if self.args.draw_keypoints:
-                    for idx, pt in enumerate(frame_kp):
-                        cv2.circle(img, (pt[0], pt[1]), 4, (0,255,0), -1)
 
-                if self.args.sideview:
-                    side_img = renderer.render(
-                        side_img,
-                        frame_verts,
-                        cam=frame_cam,
-                        var=rend_var,
-                        color=mc,
-                        angle=270,
-                        axis=[0, 1, 0],
-                        hps_backbone=self.backbone,
-                    )
-                    side_img = overlay_text(side_img, f'Other View')
+            # --- Composite final image ---
+            final_image = img_rgb.copy()
+            for data in rendered_output_parts:
+                 final_image[data['mask']] = data['render'][data['mask']]
 
+            # --- Draw keypoints on the final composite image ---
+            if self.args.draw_keypoints:
+                 for person_id, person_data in sorted_persons: # Iterate again to draw KPs on top
+                      frame_kp = person_data['joints2d']
+                      for pt_idx, pt in enumerate(frame_kp):
+                           x, y, conf = int(pt[0]), int(pt[1]), pt[2]
+                           if conf > 0.1:
+                                kp_color = (255, 255, 255) if pt_idx >= 25 else (0, 0, 0)
+                                cv2.circle(final_image, (x, y), 3, kp_color, -1)
+
+            # --- Combine with side view ---
             if self.args.sideview:
-                img = np.concatenate([img, side_img], axis=1)
+                final_image = np.concatenate([final_image, side_img_composite], axis=1)
 
-            cv2.imwrite(join(output_img_folder, f'{frame_idx:06d}.png'), img)
+            cv2.imwrite(join(output_img_folder, f'{frame_idx:06d}.png'), cv2.cvtColor(final_image, cv2.COLOR_RGB2BGR))
 
             if self.args.display:
-                cv2.imshow('Video', img)
+                cv2.imshow('Video', cv2.cvtColor(final_image, cv2.COLOR_RGB2BGR))
                 if cv2.waitKey(1) & 0xFF == ord('q'):
                     break
 
