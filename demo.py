@@ -14,6 +14,7 @@
 #
 # Contact: ps-license@tuebingen.mpg.de
 
+# -*- coding: utf-8 -*-
 import os
 os.environ['PYOPENGL_PLATFORM'] = 'egl'
 
@@ -23,23 +24,37 @@ import time
 import joblib
 import torch
 import argparse
+import numpy as np
 from os.path import join, isfile, isdir, basename, dirname
 from loguru import logger
 
-sys.path.append('.')
+import tempfile
+from os.path import join
+
+# Existing imports for video/folder demos
 from pocolib.core.tester import POCOTester
 from pocolib.utils.demo_utils import (
     download_youtube_clip,
     video_to_images,
     images_to_video,
+    convert_crop_cam_to_orig_img,
 )
+# Additional imports needed for webcam mode
+from pocolib.utils.vibe_image_utils import get_single_image_crop_demo
+from pocolib.utils.image_utils import calculate_bbox_info, calculate_focal_length
+from pocolib.utils.vibe_renderer import Renderer
+
+# Import multi-person tracker
+from multi_person_tracker import MPT
 
 MIN_NUM_FRAMES = 0
-
 
 def main(args):
 
     demo_mode = args.mode
+
+    # Initialize the POCO tester (builds the model, loads checkpoints, etc.)
+    tester = POCOTester(args)
 
     if demo_mode == 'video':
         video_file = args.vid_file
@@ -75,8 +90,46 @@ def main(args):
             )
         output_img_folder = join(output_path, 'tmp_images_output')
         os.makedirs(output_img_folder, exist_ok=True)
+
+        logger.add(join(output_path, 'demo.log'), level='INFO', colorize=False)
+        logger.info(f'Demo options: \n {args}')
+
+        # Run tracking and subsequent POCO inference on video frames...
+        tracking_method = args.tracking_method
+        if isfile(join(input_path, f'tracking_results_{tracking_method}.pkl')):
+            logger.info(f'Skipping running the tracker as results already exists at {input_path}')
+            tracking_results = joblib.load(join(input_path, f'tracking_results_{tracking_method}.pkl'))
+        else:
+            tracking_results = tester.run_tracking(video_file, input_image_folder, input_path)
+            logger.info(f'Saving tracking results at {input_path}/tracking_results_{tracking_method}.pkl')
+            joblib.dump(tracking_results, join(input_path, f'tracking_results_{tracking_method}.pkl'))
+        poco_time = time.time()
+        poco_results = tester.run_on_video(tracking_results, input_image_folder, img_shape[1], img_shape[0])
+        end = time.time()
+
+        fps = num_frames / (end - poco_time)
+        logger.info(f'Saving the model..')
+        torch.save(tester.model.state_dict(), f'{output_path}/best_model.pt')
+        del tester.model
+
+        logger.info(f'poco FPS: {fps:.2f}')
+        total_time = time.time() - poco_time
+        logger.info(f'Total time spent: {total_time:.2f} seconds (including model loading time).')
+        logger.info(f'Total FPS (including model loading time): {num_frames / total_time:.2f}.')
+
+        if not args.no_render:
+            tester.render_results(poco_results, input_image_folder, output_img_folder, output_path,
+                                  img_shape[1], img_shape[0], num_frames)
+            # ========= Save rendered video ========= #
+            vid_name = basename(video_file)
+            save_name = f'{vid_name.replace(".mp4", "")}_{args.exp}_result.mp4'
+            save_name = join(output_path, save_name)
+            logger.info(f'Saving result video to {save_name}')
+            images_to_video(img_folder=output_img_folder, output_vid_file=save_name)
+            images_to_video(img_folder=input_image_folder, output_vid_file=join(output_path, vid_name))
+
     elif demo_mode == 'folder':
-        args.tracker_batch_size = 1 # As each image can be of different sizes
+        args.tracker_batch_size = 1  # As each image can be of different sizes
         if args.image_folder:
             input_image_folder = args.image_folder
             output_path = join(args.output_folder, input_image_folder.rstrip('/').split('/')[-1] + '_' + args.exp)
@@ -95,83 +148,9 @@ def main(args):
         output_img_folder = join(output_path, 'poco_results')
         os.makedirs(output_img_folder, exist_ok=True)
         num_frames = len(os.listdir(input_image_folder))
-    elif demo_mode == 'directory':
-        args.tracker_batch_size = 1
-        input_image_dir = args.image_folder
-        output_path = args.output_folder
 
-    elif demo_mode == 'webcam':
-        logger.error('Webcam demo is in progress!..')
-        temp_cap = cv2.VideoCapture(0)
-        if not temp_cap.isOpened():
-            logger.error('Webcam not available!')
-            exit(1)
-        ret, frame = temp_cap.read()
-        if not ret:
-            logger.error('Failed to capture frame for initialization')
-            exit(1)
-        height, width = frame.shape[:2]
-        logger.info(f'Initial webcam frame size: {width}x{height}')
-        # For webcam mode, we use output_folder as the output path.
-        output_path = args.output_folder
-        os.makedirs(output_path, exist_ok=True)
-        temp_cap.release()
-
-    else:
-        raise ValueError(f'{demo_mode} is not a valid demo mode.')
-
-    logger.add(
-        join(output_path, 'demo.log'),
-        level='INFO',
-        colorize=False,
-    )
-
-    logger.info(f'Demo options: \n {args}')
-
-    tester = POCOTester(args)
-
-    total_time = time.time()
-    if args.mode == 'video':
-        logger.info(f'Input video number of frames {num_frames}')
-        orig_height, orig_width = img_shape[:2]
-        total_time = time.time()
-        tracking_method = args.tracking_method
-        if isfile(join(input_path, f'tracking_results_{tracking_method}.pkl')):
-            logger.info(f'Skipping running the tracker as results already exists at {input_path}')
-            tracking_results = joblib.load(join(input_path, f'tracking_results_{tracking_method}.pkl'))
-        else:
-            tracking_results = tester.run_tracking(video_file, input_image_folder, input_path)
-            logger.info(f'Saving tracking results at {input_path}/tracking_results_{tracking_method}.pkl')
-            joblib.dump(tracking_results, join(input_path, f'tracking_results_{tracking_method}.pkl'))
-        poco_time = time.time()
-        poco_results = tester.run_on_video(tracking_results, input_image_folder, orig_width, orig_height)
-        end = time.time()
-
-        fps = num_frames / (end - poco_time)
-        logger.info(f'Saving the model..')
-        torch.save(tester.model.state_dict(), f'{output_path}/best_model.pt')
-
-        del tester.model
-
-        logger.info(f'poco FPS: {fps:.2f}')
-        total_time = time.time() - total_time
-        logger.info(f'Total time spent: {total_time:.2f} seconds (including model loading time).')
-        logger.info(f'Total FPS (including model loading time): {num_frames / total_time:.2f}.')
-
-        if not args.no_render:
-            tester.render_results(poco_results, input_image_folder, output_img_folder, output_path,
-                                  orig_width, orig_height, num_frames)
-
-            # ========= Save rendered video ========= #
-            vid_name = basename(video_file)
-            save_name = f'{vid_name.replace(".mp4", "")}_{args.exp}_result.mp4'
-            save_name = join(output_path, save_name)
-            logger.info(f'Saving result video to {save_name}')
-            images_to_video(img_folder=output_img_folder, output_vid_file=save_name)
-            images_to_video(img_folder=input_image_folder, output_vid_file=join(output_path, vid_name))
-
-    elif args.mode == 'folder':
-        logger.info(f'Number of input frames {num_frames}')
+        logger.add(join(output_path, 'demo.log'), level='INFO', colorize=False)
+        logger.info(f'Demo options: \n {args}')
 
         total_time = time.time()
         if isfile(join(output_path, 'detection_results.pkl')):
@@ -186,7 +165,6 @@ def main(args):
         end = time.time()
 
         fps = num_frames / (end - poco_time)
-
         del tester.model
 
         logger.info(f'poco FPS: {fps:.2f}')
@@ -194,9 +172,12 @@ def main(args):
         logger.info(f'Total time spent: {total_time:.2f} seconds (including model loading time).')
         logger.info(f'Total FPS (including model loading time): {num_frames / total_time:.2f}.')
 
-    elif args.mode == 'directory':
-        image_dirs = [join(input_image_dir, n) for n in sorted(os.listdir(input_image_dir)) \
-                                                        if isdir(join(input_image_dir, n))]
+    elif demo_mode == 'directory':
+        args.tracker_batch_size = 1
+        input_image_dir = args.image_folder
+        output_path = args.output_folder
+        image_dirs = [join(input_image_dir, n) for n in sorted(os.listdir(input_image_dir))
+                      if isdir(join(input_image_dir, n))]
         start_dir = min(args.dir_chunk * args.dir_chunk_size, len(image_dirs))
         end_dir = min((1+args.dir_chunk) * args.dir_chunk_size, len(image_dirs))
         for folder_id in range(start_dir, end_dir):
@@ -224,32 +205,173 @@ def main(args):
 
                 tester.run_on_image_folder(input_image_folder, detections, output_path, output_img_folder)
 
-    elif args.mode == 'webcam':
+    elif demo_mode == 'webcam':
+        logger.add("webcam_demo.log", level='INFO', colorize=False)
+        logger.info(f'Demo options (webcam): \n {args}')
+
+        mot = MPT(
+            device=tester.device,
+            batch_size=1, # Batch size for MPT internal dataloader, less relevant here
+            display=args.display,
+            detector_type=args.detector,
+            output_format='dict', # This might not be relevant if using detect_frame
+            yolo_img_size=args.yolo_img_size,
+        )
         cap = cv2.VideoCapture(0)
         if not cap.isOpened():
-            logger.error('Webcam not available!')
-            exit(1)
-        logger.info("Starting webcam demo...")
+            logger.error("Cannot open webcam")
+            exit()
+
+        logger.info("Starting webcam stream. Press 'q' to exit.")
+        ret, frame = cap.read() # Initial read
+
         while True:
+            frame_start = time.time()
             ret, frame = cap.read()
             if not ret:
-                logger.error('Failed to capture frame from webcam')
+                logger.error("Failed to grab frame")
                 break
 
-            start_time = time.time()
-            rendered_frame = tester.run_on_webcam_frame(frame)
-            fps = 1.0 / (time.time() - start_time)
-            cv2.putText(rendered_frame, f'FPS: {fps:.2f}', (10, 30),
+            rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+            orig_h, orig_w = rgb_frame.shape[:2]
+
+            # 1. Get raw detections using detect_frame
+            dets_raw = mot.detect_frame(rgb_frame) # Returns [[x1, y1, x2, y2, score], ...]
+
+            # 2. Manually apply the transformation from prepare_output_detections
+            dets_prepared_list = []
+            if dets_raw is not None and dets_raw.shape[0] > 0:
+                for d in dets_raw: # d is [x1, y1, x2, y2, score]
+                    w, h = d[2] - d[0], d[3] - d[1]
+                    c_x, c_y = d[0] + w / 2, d[1] + h / 2
+                    size = max(w, h) # Use max dimension as size
+                    # Create the [cx, cy, size, size] format
+                    bbox_prepared = np.array([c_x, c_y, size, size])
+                    dets_prepared_list.append(bbox_prepared)
+
+            # Convert the list for the current frame into a NumPy array
+            dets = np.array(dets_prepared_list) # Now dets is [[cx, cy, sz, sz], ...]
+
+            # 3. Check if any detections remain after preparation
+            if dets.shape[0] == 0: # Check the prepared detections
+                # Overlay FPS even if no detections
+                frame_end = time.time()
+                fps = 1.0 / (frame_end - frame_start)
+                cv2.putText(frame, f"FPS: {fps:.2f}", (10, 30),
+                            cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2)
+                cv2.imshow("Webcam Demo", frame)
+                if cv2.waitKey(1) & 0xFF == ord('q'):
+                    break
+                continue
+
+            # --- Downstream processing loop (should now work correctly) ---
+            inp_images = []
+            bbox_info_list = []
+            focal_lengths_list = []
+            # These lists now correspond to the prepared detections
+            scales_list = []
+            centers_list = []
+            orig_shapes_list = []
+
+            # Process each PREPARED detection
+            for det in dets: # det is now [cx, cy, sz, sz]
+                # Assuming get_single_image_crop_demo uses the center/scale logic internally
+                # or expects this specific format. We pass the prepared bbox.
+                norm_img, bbox_processed, img_patch = get_single_image_crop_demo(
+                    rgb_frame,
+                    det, # Pass the prepared [cx, cy, sz, sz] bbox
+                    kp_2d=None, # Keep kp_2d=None as before
+                    scale=1.0, # Keep scale=1.0 as before
+                    crop_size=tester.model_cfg.DATASET.IMG_RES
+                )
+
+                # It seems the original code derived center/scale *again* here.
+                # Let's use the values directly from the prepared 'det'
+                # which are already center and size.
+                center = [det[0], det[1]] # Use cx, cy from prepared bbox
+                # The original scale was max(det[2], det[3]) / 200.0
+                # Since det[2] and det[3] are both 'size' now, this becomes:
+                scale_val = det[2] / 200.0 # Use size / 200.0 as scale
+
+                inp_images.append(norm_img.float())
+                orig_shape = [orig_h, orig_w]
+
+                centers_list.append(center)
+                orig_shapes_list.append(orig_shape)
+                scales_list.append(scale_val)
+
+                # calculate_bbox_info expects center and scale
+                bbox_info = calculate_bbox_info(center, scale_val, orig_shape)
+                bbox_info_list.append(bbox_info)
+
+                focal_length = calculate_focal_length(orig_h, orig_w)
+                focal_lengths_list.append(focal_length)
+
+            # Prepare batch for inference
+            inp_images_tensor = torch.stack(inp_images).to(tester.device)
+            batch = {
+                'img': inp_images_tensor,
+                'bbox_info': torch.FloatTensor(bbox_info_list).to(tester.device),
+                'focal_length': torch.FloatTensor(focal_lengths_list).to(tester.device),
+                'scale': torch.FloatTensor(scales_list).to(tester.device),
+                'center': torch.FloatTensor(centers_list).to(tester.device),
+                'orig_shape': torch.FloatTensor(orig_shapes_list).to(tester.device),
+            }
+
+            # Run model inference
+            tester.model.eval()
+            with torch.no_grad():
+                output = tester.model(batch)
+
+            # Convert predicted camera parameters to original image space
+            pred_cam_np = output['pred_cam'].cpu().numpy()
+
+            # *** IMPORTANT: Check what bbox format convert_crop_cam_to_orig_img expects! ***
+            # It might expect the raw [x1,y1,x2,y2] boxes OR the prepared [cx,cy,sz,sz] boxes.
+            # If it expects raw boxes, pass dets_raw here instead of dets.
+            # If it expects prepared boxes, pass dets. Let's assume prepared for now based on original flow.
+            orig_cam = convert_crop_cam_to_orig_img(
+                cam=pred_cam_np,
+                bbox=dets, # Passing the prepared [cx, cy, sz, sz] boxes
+                img_width=orig_w,
+                img_height=orig_h
+            )
+            # *******************************************************************************
+
+            # Initialize renderer
+            renderer = Renderer(
+                resolution=(orig_w, orig_h),
+                orig_img=True,
+                wireframe=args.wireframe,
+                uncert_type=tester.uncert_type,
+            )
+
+            # Render results
+            rendered_frame = frame.copy()
+            rendered_frame = cv2.cvtColor(rendered_frame, cv2.COLOR_BGR2RGB)
+            for i in range(len(dets)): # Iterate based on number of prepared detections
+                if isinstance(output['smpl_vertices'], torch.Tensor):
+                    verts = output['smpl_vertices'][i].cpu().numpy()
+                else:
+                    verts = output['smpl_vertices'][i]
+                color = [0.7, 0.7, 0.7]
+                rendered_frame = renderer.render(rendered_frame, verts, cam=orig_cam[i], var=None, color=color)
+
+            # Calculate FPS
+            frame_end = time.time()
+            fps = 1.0 / (frame_end - frame_start)
+
+            # Display
+            rendered_frame = cv2.cvtColor(rendered_frame, cv2.COLOR_RGB2BGR)
+            cv2.putText(rendered_frame, f"FPS: {fps:.2f}", (10, 30),
                         cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2)
-            cv2.imshow('Webcam Demo', rendered_frame)
+            cv2.imshow("Webcam Demo", rendered_frame)
             if cv2.waitKey(1) & 0xFF == ord('q'):
                 break
+
         cap.release()
         cv2.destroyAllWindows()
-        logger.info("Webcam demo ended.")
 
-
-    logger.info('================= END =================')
 
 
 if __name__ == '__main__':
@@ -257,93 +379,63 @@ if __name__ == '__main__':
 
     parser.add_argument('--cfg', type=str, default='configs/demo_poco_cliff.yaml',
                         help='config file that defines model hyperparams')
-
     parser.add_argument('--ckpt', type=str, default='data/poco_cliff.pt',
                         help='checkpoint path')
-
     parser.add_argument('--inf_model', type=str, default='best',
                         help='select the model from checkpoint folder')
-
     parser.add_argument('--exp', type=str, default='',
                         help='short description of the experiment')
-
     parser.add_argument('--mode', default='video', choices=['video', 'folder', 'directory', 'webcam'],
                         help='Demo type')
-
     parser.add_argument('--vid_file', type=str,
                         help='input video path or youtube link')
-
     parser.add_argument('--image_folder', type=str,
                         help='input image folder')
-
     parser.add_argument('--skip_frame', type=int, default=1,
                         help='Skip frames when running demo on image folder')
-
     parser.add_argument('--output_folder', type=str, default='out',
                         help='output folder to write results')
-
     parser.add_argument('--dir_chunk_size', type=int, default=1000,
                         help='Run demo on chunk size directory')
-
     parser.add_argument('--dir_chunk', type=int, default=0,
                         help='instance of chunk for demo on directory')
-
     parser.add_argument('--tracking_method', type=str, default='bbox', choices=['bbox', 'pose'],
                         help='tracking method to calculate the tracklet of a subject from the input video')
-
     parser.add_argument('--detector', type=str, default='yolo', choices=['yolo', 'maskrcnn'],
                         help='object detector to be used for bbox tracking')
-
-    parser.add_argument('--yolo_img_size', type=int, default=416,
+    parser.add_argument('--yolo_img_size', type=int, default=256,
                         help='input image size for yolo detector')
-
     parser.add_argument('--tracker_batch_size', type=int, default=12,
                         help='batch size of object detector used for bbox tracking')
-
     parser.add_argument('--staf_dir', type=str, default='/home/sdwivedi/work/openpose',
                         help='path to directory STAF pose tracking method installed.')
-
     parser.add_argument('--batch_size', type=int, default=64,
                         help='batch size of poco')
-
     parser.add_argument('--display', action='store_true',
                         help='visualize the results of each step during demo')
-
     parser.add_argument('--smooth', action='store_true',
                         help='smooth the results to prevent jitter')
-
     parser.add_argument('--min_cutoff', type=float, default=0.004,
-                        help='one euro filter min cutoff. '
-                             'Decreasing the minimum cutoff frequency decreases slow speed jitter')
-
+                        help='one euro filter min cutoff. Decreasing the minimum cutoff frequency decreases slow speed jitter')
     parser.add_argument('--beta', type=float, default=1.5,
-                        help='one euro filter beta. '
-                             'Increasing the speed coefficient(beta) decreases speed lag.')
-
+                        help='one euro filter beta. Increasing the speed coefficient(beta) decreases speed lag.')
     parser.add_argument('--no_render', action='store_true',
                         help='disable final rendering of output video.')
-
     parser.add_argument('--render_crop', action='store_true',
                         help='Render cropped image')
-
     parser.add_argument('--no_uncert_color', action='store_true',
                         help='No uncertainty color')
-
     parser.add_argument('--wireframe', action='store_true',
                         help='render all meshes as wireframes.')
-
     parser.add_argument('--sideview', action='store_true',
                         help='render meshes from alternate viewpoint.')
-
     parser.add_argument('--draw_keypoints', action='store_true',
                         help='draw 2d keypoints on rendered image.')
-
     parser.add_argument('--no_kinematic_uncert', action='store_false',
                         help='Do not use SMPL Kinematic for uncert')
-
     parser.add_argument('--save_obj', action='store_true',
                         help='save results as .obj files.')
 
     args = parser.parse_args()
-
     main(args)
+
