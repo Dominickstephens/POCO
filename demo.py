@@ -45,13 +45,24 @@ from pocolib.utils.image_utils import calculate_bbox_info, calculate_focal_lengt
 from pocolib.utils.vibe_renderer import Renderer
 
 # Import multi-person tracker
-from multi_person_tracker import MPT
+from multi_person_tracker import MPT # type: ignore
 
 MIN_NUM_FRAMES = 0
+
+def str2bool(v):
+    if isinstance(v, bool):
+        return v
+    if v.lower() in ('yes', 'true', 't', 'y', '1'):
+        return True
+    elif v.lower() in ('no', 'false', 'f', 'n', '0'):
+        return False
+    else:
+        raise argparse.ArgumentTypeError('Boolean value expected.')
 
 def main(args):
 
     demo_mode = args.mode
+    stream_mode = args.stream
 
     # Initialize the POCO tester (builds the model, loads checkpoints, etc.)
     tester = POCOTester(args)
@@ -217,13 +228,18 @@ def main(args):
             output_format='dict', # This might not be relevant if using detect_frame
             yolo_img_size=args.yolo_img_size,
         )
-        cap = cv2.VideoCapture(0)
-        if not cap.isOpened():
-            logger.error("Cannot open webcam")
-            exit()
+        if (stream_mode): 
+            rtmp_url = "rtmp://34.89.24.203:1935/live/webcam"
+            cap = cv2.VideoCapture(rtmp_url, cv2.CAP_FFMPEG)
+            frame = cap.read() # Initial read
+        else:
+            cap = cv2.VideoCapture(0)
+            if not cap.isOpened():
+                logger.error("Cannot open webcam")
+                exit()
+            ret, frame = cap.read() # Initial read
 
         logger.info("Starting webcam stream. Press 'q' to exit.")
-        ret, frame = cap.read() # Initial read
 
         while True:
             frame_start = time.time()
@@ -395,6 +411,8 @@ if __name__ == '__main__':
                         help='Skip frames when running demo on image folder')
     parser.add_argument('--output_folder', type=str, default='out',
                         help='output folder to write results')
+    parser.add_argument('--stream', type=str2bool, default=False,
+                        help='Stream via RTMP for remote work')
     parser.add_argument('--dir_chunk_size', type=int, default=1000,
                         help='Run demo on chunk size directory')
     parser.add_argument('--dir_chunk', type=int, default=0,

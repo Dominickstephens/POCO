@@ -6,6 +6,7 @@ trash/
 data/
 .idea/
 copy_data.sh
+optimise/
 # Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[cod]
