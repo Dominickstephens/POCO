@@ -130,7 +130,7 @@ def main(args):
 
         if not args.no_render:
             tester.render_results(poco_results, input_image_folder, output_img_folder, output_path,
-                                  img_shape[1], img_shape[0], num_frames)
+            img_shape[1], img_shape[0], num_frames)
             # ========= Save rendered video ========= #
             vid_name = basename(video_file)
             save_name = f'{vid_name.replace(".mp4", "")}_{args.exp}_result.mp4'
@@ -188,7 +188,7 @@ def main(args):
         input_image_dir = args.image_folder
         output_path = args.output_folder
         image_dirs = [join(input_image_dir, n) for n in sorted(os.listdir(input_image_dir))
-                      if isdir(join(input_image_dir, n))]
+        if isdir(join(input_image_dir, n))]
         start_dir = min(args.dir_chunk * args.dir_chunk_size, len(image_dirs))
         end_dir = min((1+args.dir_chunk) * args.dir_chunk_size, len(image_dirs))
         for folder_id in range(start_dir, end_dir):
